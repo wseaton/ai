@@ -29,6 +29,7 @@ Use with branch chains to route stateful and stateless requests to different clu
 | `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
 | `headers.stream` | string | no | Header name for the extracted stream flag. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-stream` remains allowed. |
 | `headers.mode` | string | no | Header name for the computed mode (`stateless` or `stateful`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-responses-mode` remains allowed. |
+| `background` | `reject` \| `continue` | no | Handling of Responses create requests with `background: true`. |
 
 ## Examples
 

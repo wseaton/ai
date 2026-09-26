@@ -954,6 +954,21 @@ async fn background_true_is_rejected_even_when_invalid_formats_continue() {
 }
 
 #[tokio::test]
+async fn background_true_continues_to_the_store_when_configured() {
+    let ctx = run_filter("background: continue", r#"{"input":"test","background":true}"#).await;
+    assert_eq!(
+        ctx.get_metadata("openai_responses_format.background"),
+        Some("true"),
+        "the response store reads the background flag"
+    );
+    assert!(
+        serde_yaml::from_str::<serde_yaml::Value>("background: sometimes")
+            .map(|config| ResponsesFormatFilter::from_config(&config).is_err())
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn mode_stateful_when_conversation_present() {
     let ctx = run_filter("{}", r#"{"input":"test","store":false,"conversation":{"id":"conv_1"}}"#).await;
     let results = ctx.filter_results.get("openai_responses_format").unwrap();

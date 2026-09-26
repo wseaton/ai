@@ -294,6 +294,19 @@ async fn background_mode_is_rejected_before_upstream_contact() {
 }
 
 #[tokio::test]
+async fn background_mode_continues_when_the_store_runs_it() {
+    let filter = filter("background: continue");
+    let request = create_request();
+    let action = run(
+        filter.as_ref(),
+        &request,
+        &json!({"model": "gpt-4.1", "input": "hi", "background": true}),
+    )
+    .await;
+    assert!(matches!(action, FilterAction::Release), "{action:?}");
+}
+
+#[tokio::test]
 async fn an_unclassifiable_body_follows_on_invalid_continue() {
     // The default is `continue`. The classifier this replaces forwarded such a
     // body and still published its format, so chains that route on those keys

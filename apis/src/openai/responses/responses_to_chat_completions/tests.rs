@@ -133,36 +133,16 @@ fn legacy_max_body_bytes_is_rejected() {
 }
 
 #[test]
-fn streaming_with_reasoning_dialect_is_rejected() {
-    // Streaming reasoning translation is deferred (#36).
-    let request = json!({"model": "m", "input": "hi", "stream": true});
+fn streaming_and_non_streaming_requests_are_allowed_with_or_without_a_dialect() {
     let vllm = ReasoningOptions {
         dialect: ReasoningDialect::Vllm,
         ..ReasoningOptions::default()
     };
-
-    let action = reject_incompatible_reasoning(&request, &vllm, true)
-        .expect_err("streaming must be rejected while a reasoning dialect is enabled");
-    assert!(matches!(action, FilterAction::Reject(_)));
-}
-
-#[test]
-fn streaming_without_reasoning_dialect_is_allowed() {
-    let request = json!({"model": "m", "input": "hi", "stream": true});
-
-    reject_incompatible_reasoning(&request, &ReasoningOptions::default(), true)
-        .expect("the default dialect performs no reasoning translation and permits streaming");
-}
-
-#[test]
-fn non_streaming_with_reasoning_dialect_is_allowed() {
-    let request = json!({"model": "m", "input": "hi"});
-    let vllm = ReasoningOptions {
-        dialect: ReasoningDialect::Vllm,
-        ..ReasoningOptions::default()
-    };
-
-    reject_incompatible_reasoning(&request, &vllm, false).expect("non-streaming reasoning translation is supported");
+    for stream in [true, false] {
+        let request = json!({"model": "m", "input": "hi", "stream": stream});
+        reject_incompatible_reasoning(&request, &vllm).expect("reasoning translation streams too");
+        reject_incompatible_reasoning(&request, &ReasoningOptions::default()).expect("no dialect, no reasoning");
+    }
 }
 
 #[test]
@@ -2110,6 +2090,57 @@ async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary(
         context.get_metadata(ARMED_KEY).is_none(),
         "summary rejection must not arm response processing"
     );
+}
+
+/// Run the filter's request body phase for `request` under `config`.
+async fn translate_request_with(config: &str, request: serde_json::Value) -> (FilterAction, Option<Bytes>) {
+    let yaml = serde_yaml::from_str(config).unwrap();
+    let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
+    let http_request = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut context = crate::test_utils::make_filter_context(http_request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.set_metadata("openai_responses_format.stream", "false");
+    let mut body = Some(Bytes::from(request.to_string()));
+    context.extensions.insert(ResponsesState::from_request_body(request));
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    (action, body)
+}
+
+#[tokio::test]
+async fn reasoning_summary_request_runs_without_a_summary_when_configured() {
+    let (action, body) = translate_request_with(
+        "reasoning:\n  dialect: vllm\n  summary: omit",
+        json!({"model": "deepseek-r1", "input": "hello", "reasoning": {"summary": "auto"}, "stream": false}),
+    )
+    .await;
+
+    assert!(matches!(action, FilterAction::Continue), "{action:?}");
+    let forwarded: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(forwarded["messages"][0]["content"], "hello");
+}
+
+#[tokio::test]
+async fn auto_truncation_is_rejected_unless_configured() {
+    let request = json!({"model": "m", "input": "hello", "truncation": "auto", "stream": false});
+
+    let (action, _) = translate_request_with("{}", request.clone()).await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("auto truncation should be rejected by default");
+    };
+    assert_eq!(rejection.status, 400);
+
+    let (action, body) = translate_request_with("truncation_auto: disabled", request).await;
+    assert!(matches!(action, FilterAction::Continue), "{action:?}");
+    let forwarded: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert!(forwarded.get("truncation").is_none(), "{forwarded}");
+
+    let yaml = serde_yaml::from_str("truncation_auto: sometimes").unwrap();
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
+    let yaml = serde_yaml::from_str("reasoning:\n  summary: sometimes").unwrap();
+    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
 }
 
 #[tokio::test]

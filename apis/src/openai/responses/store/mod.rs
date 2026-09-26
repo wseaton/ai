@@ -9,6 +9,7 @@
 //!
 //! [`ResponseStore`]: crate::store::ResponseStore
 
+mod background;
 mod config;
 mod filter;
 mod input_items;

@@ -2234,6 +2234,7 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 16,
+            summary: super::reasoning::SummaryHandling::Reject,
         };
         // Each item is 10 bytes and passes its own check, but concatenating them
         // (with the newline separator) exceeds the ceiling.
@@ -2308,6 +2309,7 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 16,
+            summary: super::reasoning::SummaryHandling::Reject,
         };
         // Two 10-byte items straddling a function call each pass individually, but
         // their combined size on the shared tool-call turn exceeds the ceiling.
@@ -2376,6 +2378,7 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 4,
+            summary: super::reasoning::SummaryHandling::Reject,
         };
         let error = super::chat_completions::responses_request_to_chat_request(
             &json!({
@@ -2758,6 +2761,7 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 4,
+            summary: super::reasoning::SummaryHandling::Reject,
         };
         let context = super::chat_completions::ResponseContext::from_responses_request(&request, "abc".to_owned(), 0)
             .with_completed_at(1)

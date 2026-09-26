@@ -36,7 +36,25 @@ fn request_body() -> Value {
 
 /// Build a converter with the given limits.
 fn converter(limits: StreamLimits) -> StreamConverter {
-    StreamConverter::new(RESPONSE_ID.to_owned(), CREATED_AT, limits)
+    StreamConverter::new(RESPONSE_ID.to_owned(), CREATED_AT, limits, ReasoningOptions::default())
+}
+
+/// The vLLM reasoning dialect.
+fn vllm_reasoning() -> ReasoningOptions {
+    ReasoningOptions {
+        dialect: crate::openai::translation::reasoning::ReasoningDialect::Vllm,
+        ..ReasoningOptions::default()
+    }
+}
+
+/// Run a complete provider stream through a converter using `reasoning`.
+fn run_reasoning_stream(chunks: &[&str], reasoning: ReasoningOptions) -> Vec<(String, Value)> {
+    let body = request_body();
+    let mut conv = StreamConverter::new(RESPONSE_ID.to_owned(), CREATED_AT, wide_limits(), reasoning);
+    let mut raw = Vec::new();
+    push(&mut conv, &body, &provider_stream(chunks), &mut raw);
+    finish(&mut conv, &body, &mut raw);
+    parse_events(&raw)
 }
 
 /// Borrow the request body's tool declarations for a snapshot, mirroring how
@@ -2676,4 +2694,141 @@ fn minimal_terminal_fits_at_floor_ceiling() {
         payload["sequence_number"], 0,
         "the minimal terminal is the stream's only event",
     );
+}
+
+// =============================================================================
+// Raw reasoning
+// =============================================================================
+
+const REASONING_CHUNKS: [&str; 6] = [
+    r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+    r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"reasoning":"Two plus"}}]}"#,
+    r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"reasoning":" two."}}]}"#,
+    r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"content":"4"}}]}"#,
+    r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+    r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":6,"total_tokens":11}}"#,
+];
+
+#[test]
+fn reasoning_streams_as_its_own_item_before_the_message() {
+    let events = run_reasoning_stream(&REASONING_CHUNKS, vllm_reasoning());
+
+    assert_eq!(
+        types(&events),
+        vec![
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.reasoning_text.delta",
+            "response.reasoning_text.delta",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.reasoning_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ],
+    );
+    let item_id = "rs_resp_test_chatcmpl_1";
+    let added = &events[2].1;
+    assert_eq!(added["output_index"], 0);
+    assert_eq!(added["item"]["id"], item_id);
+    assert_eq!(added["item"]["type"], "reasoning");
+    assert_eq!(events[3].1["part"], json!({"type": "reasoning_text", "text": ""}));
+    assert_eq!(events[4].1["delta"], "Two plus");
+    assert_eq!(events[4].1["item_id"], item_id);
+    assert_eq!(events[6].1["output_index"], 1, "the message follows the reasoning");
+    assert_eq!(events[9].1["text"], "Two plus two.");
+    assert_eq!(
+        events[10].1["part"],
+        json!({"type": "reasoning_text", "text": "Two plus two."})
+    );
+    assert_eq!(events[11].1["item"]["status"], "completed");
+    assert_eq!(events[11].1["item"]["content"][0]["text"], "Two plus two.");
+
+    let terminal = &events.last().unwrap().1["response"];
+    let body = request_body();
+    let mut context =
+        ResponseContext::from_responses_request(&body, RESPONSE_ID.to_owned(), CREATED_AT).with_completed_at(NOW);
+    context.reasoning_options = vllm_reasoning();
+    let finite = chat_response_to_response_resource(
+        &json!({"id": "chatcmpl_1", "object": "chat.completion", "model": "m",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "4", "reasoning": "Two plus two."}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}}),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(
+        terminal["output"], finite["output"],
+        "streamed terminal matches the finite translation"
+    );
+    assert_eq!(terminal["output"][0]["id"], item_id);
+}
+
+#[test]
+fn reasoning_before_a_tool_call_keeps_output_order() {
+    let events = run_reasoning_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Need the tool."}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ],
+        vllm_reasoning(),
+    );
+    let terminal = &events.last().unwrap().1;
+    assert_eq!(terminal["type"], "response.completed");
+    let output = terminal["response"]["output"].as_array().unwrap();
+    let kinds: Vec<&str> = output.iter().map(|item| item["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["reasoning", "function_call"]);
+    assert_eq!(output[0]["content"][0]["text"], "Need the tool.");
+}
+
+#[test]
+fn reasoning_after_output_began_fails_closed() {
+    let events = run_reasoning_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"4"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"reasoning":"late"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ],
+        vllm_reasoning(),
+    );
+    let terminal = &events.last().unwrap().1;
+    assert_eq!(terminal["type"], "response.failed");
+    assert_eq!(
+        terminal["response"]["error"]["message"],
+        "upstream sent reasoning after output began"
+    );
+}
+
+#[test]
+fn reasoning_over_the_dialect_limit_fails_closed() {
+    let events = run_reasoning_stream(
+        &REASONING_CHUNKS,
+        ReasoningOptions {
+            max_reasoning_bytes: 10,
+            ..vllm_reasoning()
+        },
+    );
+    let terminal = &events.last().unwrap().1;
+    assert_eq!(terminal["type"], "response.failed");
+    assert_eq!(
+        terminal["response"]["error"]["message"],
+        "upstream reasoning exceeded the size limit"
+    );
+}
+
+#[test]
+fn reasoning_is_ignored_without_a_dialect() {
+    let events = run_reasoning_stream(&REASONING_CHUNKS, ReasoningOptions::default());
+    assert!(!types(&events).iter().any(|t| t.starts_with("response.reasoning_text")));
+    let output = events.last().unwrap().1["response"]["output"].clone();
+    assert_eq!(output.as_array().unwrap().len(), 1);
+    assert_eq!(output[0]["type"], "message");
 }

@@ -109,9 +109,13 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// `content` is `reasoning_text`. Raw reasoning is never placed in the item
 /// summary, which is reserved for safe summaries. No current dialect can
 /// generate a safe summary, so a client that requests `reasoning.summary` (or
-/// the deprecated `reasoning.generate_summary`) is rejected. Streaming reasoning
-/// translation is not yet implemented, so a streaming request is rejected when
-/// valid reasoning dialect is configured. On continuation, raw reasoning
+/// the deprecated `reasoning.generate_summary`) is rejected, unless
+/// `reasoning.summary` is `omit`, which runs the request and returns reasoning
+/// without a summary. A streaming response carries the reasoning item first,
+/// as `response.reasoning_text.delta` events; reasoning that arrives after
+/// message or tool-call output began fails the stream. `truncation_auto:
+/// disabled` runs `truncation: "auto"` untruncated and reports `disabled`,
+/// where the default rejects it. On continuation, raw reasoning
 /// is replayed into the following assistant turn's `reasoning` field, preserving
 /// its ordinary `content`. Reasoning-only output becomes a standalone assistant
 /// message at a turn boundary or end of input. Reasoning input requires an
@@ -304,6 +308,7 @@ impl ResponsesToChatCompletionsFilter {
             response_id,
             created_at,
             self.config.stream_limits(),
+            self.config.reasoning.clone(),
         ));
         Ok(FilterAction::Continue)
     }
@@ -470,6 +475,9 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         if let Some(action) = request_disposition(ctx) {
             return Ok(action);
         }
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            self.config.truncation_auto.apply(&mut state.request_body);
+        }
 
         let serialized = match self.translated_request_bytes(ctx)? {
             Ok(bytes) => bytes,
@@ -566,7 +574,7 @@ fn translate_canonical_state(
         return Err(missing_pipeline_state());
     };
     ensure_previous_response_rehydrated(state)?;
-    reject_incompatible_reasoning(&state.request_body, reasoning, request_is_streaming(ctx))?;
+    reject_incompatible_reasoning(&state.request_body, reasoning)?;
     // Read the *outbound* tools/tool_choice through the accessor so a
     // `openai_client_tool_compat`-lowered request (rich client tools rewritten to
     // private `function` tools in `request_body` only) translates the lowered view
@@ -594,20 +602,10 @@ fn translate_canonical_state(
 fn reject_incompatible_reasoning(
     request_body: &serde_json::Value,
     reasoning: &ReasoningOptions,
-    streaming: bool,
 ) -> Result<(), FilterAction> {
     let Some(request) = request_body.as_object() else {
         return Ok(());
     };
-    // Streaming reasoning translation is not yet implemented.
-    if streaming && reasoning.dialect.is_enabled() {
-        debug!("streaming reasoning translation is unsupported for the configured dialect");
-        return Err(FilterAction::Reject(responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "streaming is not supported when a reasoning dialect is configured",
-        )));
-    }
     validate_requested_reasoning(request, reasoning).map_err(|error| {
         debug!(error = %error, "reasoning request rejected before forwarding");
         FilterAction::Reject(responses_error_rejection(

@@ -1,0 +1,115 @@
+# OpenAI Responses in front of llm-d-async, with background mode.
+#
+# llm-d-async (https://github.com/wseaton/llm-d-async-rs) is an
+# asynchronous inference processor: requests wait in durable, deadline-ordered
+# queues, are retried and shed under flow control, and interrupted vLLM
+# generations resume from their saved tokens. It serves OpenAI-compatible
+# /v1/chat/completions that hold the connection until the queued request
+# finishes, and a request API with results delivered by request ID.
+#
+# Foreground requests are translated to Chat Completions and sent to the
+# processor's OpenAI-compatible route. The `headers` filter inside the IRR step
+# sets the llm-d inference objective and the processor deadline for them. The
+# IRR, stream-event, and translation timeouts are raised above that deadline
+# because the processor holds the connection while the request is queued.
+#
+# `background: true` requests pass openai_responses_format (`background:
+# continue`) and are run by the response store's `background` section:
+#
+#   POST /v1/responses {background: true}  -> submitted to the processor, stored
+#                                              and returned as `queued`
+#   GET /v1/responses/{id}                 -> the processor's result, when there
+#                                              is one, completes the stored
+#                                              response; otherwise its status
+#                                              (queued / in_progress) is reported
+#   POST /v1/responses/{id}/cancel         -> cancelled at the processor and
+#                                              stored as `cancelled`
+#
+# Agent clients commonly send `reasoning.summary` and `truncation: "auto"`,
+# which Chat Completions cannot represent. `summary: omit` runs them and
+# returns reasoning without a summary; `truncation_auto: disabled` runs them
+# untruncated (a context over the model's limit fails instead of being
+# trimmed) and reports `truncation: "disabled"`.
+#
+# Background mode runs stateless requests with function tools. Streaming,
+# previous_response_id, conversation, and server-side tools are rejected
+# with a 400.
+#
+# The processor listens on 127.0.0.1:3001. The response store keeps records in
+# responses.db; keep the database outside this file's directory, whose writes
+# the config watcher would treat as config changes.
+
+listeners:
+  - name: responses-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses]
+
+filter_chains:
+  - name: responses
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        background: continue
+      - filter: openai_responses_validate
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+        background:
+          processor_url: "http://127.0.0.1:3001"
+          allow_private_processor_url: true # example processor is local
+          objective: batch
+          deadline_secs: 3600
+          truncation_auto: disabled
+          reasoning:
+            dialect: vllm
+            summary: omit
+      - filter: openai_responses_rehydrate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 1
+        timeout_ms: 900000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+                timeout_secs: 900
+              - filter: responses_to_chat_completions
+                stream_timeout_secs: 0
+                truncation_auto: disabled
+                reasoning:
+                  dialect: vllm
+                  summary: omit
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+              - filter: headers
+                request_set:
+                  - name: x-llm-d-inference-objective
+                    value: interactive
+                  - name: x-llm-d-async-timeout
+                    value: 10m
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "llm-d-async"
+              - filter: load_balancer
+                clusters:
+                  - name: "llm-d-async"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local processor

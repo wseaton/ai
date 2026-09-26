@@ -35,15 +35,21 @@ use serde_json::{Map, Value, json};
 use tracing::warn;
 
 use self::{
-    chat::{ChatChoice, ChatChunk, ChatToolCallFragment},
+    chat::{ChatChoice, ChatChunk, ChatDelta, ChatToolCallFragment},
     events::StreamEvent,
     framing::{Framing, FramingError},
 };
-use crate::openai::translation::chat_completions::{
-    ResponseContext, chat_response_to_response_resource, context_has_web_search, function_call_output_item_from_parts,
-    in_progress_response_resource, message_output_item, output_text_item, refusal_item,
-    web_search_call_output_item_from_parts,
+use crate::openai::translation::{
+    chat_completions::{
+        ResponseContext, chat_response_to_response_resource, context_has_web_search,
+        function_call_output_item_from_parts, in_progress_response_resource, message_output_item, output_text_item,
+        refusal_item, web_search_call_output_item_from_parts,
+    },
+    reasoning::{ReasoningOptions, reasoning_item, reasoning_item_id},
 };
+
+/// Content index of a reasoning item's single `reasoning_text` part.
+const REASONING_CONTENT_INDEX: usize = 0;
 
 /// Resource limits governing one streaming translation.
 #[derive(Debug, Clone, Copy)]
@@ -175,6 +181,10 @@ enum ConvertError {
     UnknownFinishReason,
     /// The stream ended with an unterminated SSE frame buffered.
     IncompleteFrame,
+    /// Reasoning arrived after message or tool-call output began.
+    ReasoningAfterOutput,
+    /// Accumulated raw reasoning exceeded the dialect's byte limit.
+    ReasoningLimit,
 }
 
 impl From<FramingError> for ConvertError {
@@ -256,6 +266,19 @@ impl MessageState {
         self.next_content_index += 1;
         index
     }
+}
+
+/// Streaming state for the raw reasoning output item.
+#[derive(Debug)]
+struct ReasoningState {
+    /// Responses output index for this reasoning item.
+    output_index: usize,
+    /// Stable reasoning item id, matching the finite translation's.
+    item_id: String,
+    /// Accumulated raw reasoning.
+    text: String,
+    /// Whether the item's `done` events were emitted.
+    closed: bool,
 }
 
 /// Per-tool-call streaming state keyed by the Chat tool-call index.
@@ -348,6 +371,10 @@ pub(super) struct StreamConverter {
     usage: Option<Value>,
     /// Next Responses output index to allocate.
     next_output_index: usize,
+    /// Backend reasoning dialect behavior.
+    reasoning_options: ReasoningOptions,
+    /// Raw reasoning state, if the dialect extracted any.
+    reasoning: Option<ReasoningState>,
     /// Assistant message state, if any content appeared.
     message: Option<MessageState>,
     /// Tool-call states in first-appearance order.
@@ -360,7 +387,12 @@ pub(super) struct StreamConverter {
 
 impl StreamConverter {
     /// Create a converter for a streaming response.
-    pub(super) fn new(response_id: String, created_at: u64, limits: StreamLimits) -> Self {
+    pub(super) fn new(
+        response_id: String,
+        created_at: u64,
+        limits: StreamLimits,
+        reasoning_options: ReasoningOptions,
+    ) -> Self {
         Self {
             framing: Framing::new(limits.max_sse_buffer_bytes),
             response_id,
@@ -380,6 +412,8 @@ impl StreamConverter {
             finish_reason: None,
             usage: None,
             next_output_index: 0,
+            reasoning_options,
+            reasoning: None,
             message: None,
             tool_calls: Vec::new(),
             accumulated_bytes: 0,
@@ -645,6 +679,11 @@ impl StreamConverter {
                 // closed avoids silently completing the stream with empty output.
                 return Err(ConvertError::LegacyFunctionCall);
             }
+            if let Some(reasoning) = delta_reasoning(delta)
+                && self.reasoning_options.dialect.is_enabled()
+            {
+                self.process_reasoning_delta(reasoning, inputs, out)?;
+            }
             if let Some(content) = delta.content.as_deref()
                 && !content.is_empty()
             {
@@ -781,6 +820,79 @@ impl StreamConverter {
             ),
             out,
         )
+    }
+
+    /// Translate one raw reasoning delta. Reasoning precedes the message and
+    /// tool calls in the terminal output, so reasoning after either began fails
+    /// closed rather than stream items out of their terminal order.
+    fn process_reasoning_delta(
+        &mut self,
+        delta: &str,
+        inputs: &SnapshotInputs<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ConvertError> {
+        if self.message.is_some() || !self.tool_calls.is_empty() {
+            return Err(ConvertError::ReasoningAfterOutput);
+        }
+        let total = self.reasoning.as_ref().map_or(0, |state| state.text.len()) + delta.len();
+        if total > self.reasoning_options.max_reasoning_bytes {
+            return Err(ConvertError::ReasoningLimit);
+        }
+        self.charge_bytes(delta.len())?;
+        self.ensure_lifecycle(inputs, out)?;
+        let (item_id, output_index) = self.ensure_reasoning_item(out)?;
+        if let Some(state) = self.reasoning.as_mut() {
+            state.text.push_str(delta);
+        }
+        let event = events::reasoning_text_delta(&item_id, output_index, REASONING_CONTENT_INDEX, delta);
+        self.emit_capped(event, out)
+    }
+
+    /// Ensure the reasoning item and its `reasoning_text` part have been
+    /// announced, returning the item's id and output index.
+    fn ensure_reasoning_item(&mut self, out: &mut Vec<u8>) -> Result<(String, usize), ConvertError> {
+        if let Some(state) = self.reasoning.as_ref() {
+            return Ok((state.item_id.clone(), state.output_index));
+        }
+        let output_index = self.alloc_output_index();
+        let item_id = reasoning_item_id(&self.response_id, self.chat_id.as_deref());
+        let item = json!({"id": item_id, "type": "reasoning", "status": "in_progress", "summary": [], "content": []});
+        self.emit_capped(events::output_item_added(output_index, &item), out)?;
+        let part = reasoning_text_part("");
+        let event = events::content_part_added(&item_id, output_index, REASONING_CONTENT_INDEX, &part);
+        self.emit_capped(event, out)?;
+        self.reasoning = Some(ReasoningState {
+            output_index,
+            item_id: item_id.clone(),
+            text: String::new(),
+            closed: false,
+        });
+        Ok((item_id, output_index))
+    }
+
+    /// Close the reasoning item.
+    fn close_reasoning(&mut self, out: &mut Vec<u8>) -> Result<(), ConvertError> {
+        let status = self.terminal_item_status();
+        let Some(state) = self.reasoning.as_ref().filter(|state| !state.closed) else {
+            return Ok(());
+        };
+        let (item_id, output_index, text) = (state.item_id.clone(), state.output_index, state.text.clone());
+        let done = events::reasoning_text_done(&item_id, output_index, REASONING_CONTENT_INDEX, &text);
+        self.emit_capped(done, out)?;
+        let part = reasoning_text_part(&text);
+        let part_done = events::content_part_done(&item_id, output_index, REASONING_CONTENT_INDEX, &part);
+        self.emit_capped(part_done, out)?;
+        let item = reasoning_item(item_id, status, &text);
+        self.emit_capped(events::output_item_done(output_index, &item), out)?;
+        if let Some(state) = self.reasoning.as_mut() {
+            state.closed = true;
+        }
+        Ok(())
+    }
+
+    /// Emit one capped event.
+    fn emit_capped(&mut self, event: StreamEvent, out: &mut Vec<u8>) -> Result<(), ConvertError> {
+        emit_event(&mut self.emit, &self.limits, true, event, out)
     }
 
     /// Translate one assistant refusal delta.
@@ -1069,6 +1181,7 @@ impl StreamConverter {
         if self.emit.events_emitted.saturating_add(needed).saturating_add(1) > self.limits.max_stream_events {
             return Err(ConvertError::EventLimit);
         }
+        self.close_reasoning(out)?;
         self.close_message(inputs, out)?;
         self.close_tool_calls(out)
     }
@@ -1082,6 +1195,11 @@ impl StreamConverter {
     /// those two functions.
     fn closeout_event_budget(&self) -> usize {
         let mut needed = 0;
+        // Reasoning close: `reasoning_text.done`, `content_part.done`, then
+        // `output_item.done`, matching `close_reasoning`.
+        if self.reasoning.as_ref().is_some_and(|state| !state.closed) {
+            needed += 3;
+        }
         // Message close: `output_text`/`refusal` done + their `content_part.done`,
         // then one `output_item.done`. Skipped when the message was never added or
         // is already closed, matching `close_message`'s early return.
@@ -1517,6 +1635,9 @@ impl StreamConverter {
         {
             message.insert("refusal".to_owned(), Value::String(state.refusal.clone()));
         }
+        if let Some(state) = &self.reasoning {
+            message.insert("reasoning".to_owned(), Value::String(state.text.clone()));
+        }
         let tool_calls = self.synthetic_tool_calls();
         if !tool_calls.is_empty() {
             message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
@@ -1613,6 +1734,11 @@ impl StreamConverter {
     /// Items without a recorded stream index sort last, preserving builder order.
     fn streamed_output_index(&self, item: &Value) -> usize {
         let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+        if let Some(reasoning) = self.reasoning.as_ref()
+            && reasoning.item_id == id
+        {
+            return reasoning.output_index;
+        }
         if let Some(message) = self.message.as_ref()
             && message.item_id == id
         {
@@ -1649,6 +1775,7 @@ impl StreamConverter {
         // forms in request_body (openai_file_search_callout rewrites a hosted
         // file_search tool into a private function for the backend).
         context.tools = inputs.tools;
+        context.reasoning_options = self.reasoning_options.clone();
         if let Some(original_tool_choice) = inputs.original_tool_choice {
             context.tool_choice = Some(original_tool_choice);
         }
@@ -1743,6 +1870,20 @@ fn emit_event(
     emit.sequence_number += 1;
     emit.events_emitted += 1;
     Ok(())
+}
+
+/// The raw reasoning a delta carries, under vLLM's `reasoning` or its
+/// deprecated `reasoning_content`.
+fn delta_reasoning<'a>(delta: &'a ChatDelta<'_>) -> Option<&'a str> {
+    [delta.reasoning.as_deref(), delta.reasoning_content.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|text| !text.is_empty())
+}
+
+/// A `reasoning_text` content part.
+fn reasoning_text_part(text: &str) -> Value {
+    json!({"type": "reasoning_text", "text": text})
 }
 
 /// Whether a frame is the Chat Completions `[DONE]` sentinel.
@@ -1907,6 +2048,8 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::MissingFinishReason => "upstream stream ended without a finish reason",
         ConvertError::UnknownFinishReason => "upstream stream used an unrecognized finish reason",
         ConvertError::IncompleteFrame => "upstream stream ended with an incomplete frame",
+        ConvertError::ReasoningAfterOutput => "upstream sent reasoning after output began",
+        ConvertError::ReasoningLimit => "upstream reasoning exceeded the size limit",
         ConvertError::Serialize(_) => "internal serialization error",
     }
 }

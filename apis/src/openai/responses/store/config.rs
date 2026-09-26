@@ -8,6 +8,7 @@ use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+use super::background::{BackgroundConfig, validate_background};
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
 use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
@@ -131,6 +132,11 @@ pub(crate) struct ResponseStoreConfig {
     /// uncompressed records readable.
     #[serde(default)]
     pub compression: Option<StoreCompressionConfig>,
+
+    /// Run `background: true` Responses requests through an asynchronous
+    /// inference processor. Without it they are rejected.
+    #[serde(default)]
+    pub background: Option<BackgroundConfig>,
 }
 
 #[cfg(feature = "store-postgres")]
@@ -151,6 +157,20 @@ impl ResponseStoreConfig {
 // Config Validation
 // -----------------------------------------------------------------------------
 
+/// Validate the pool, compression, and background sections when present.
+fn validate_optional_sections(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
+    if let Some(pool) = &cfg.pool {
+        pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
+    }
+    if let Some(compression) = &cfg.compression {
+        compression.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
+    }
+    if let Some(background) = &cfg.background {
+        validate_background(background)?;
+    }
+    Ok(())
+}
+
 /// Validate the parsed configuration.
 pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
     validate_backend_available(cfg.backend)?;
@@ -165,12 +185,7 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
     if cfg.responses_table.eq_ignore_ascii_case(&cfg.conversations_table) {
         return Err(format!("{FILTER_NAME}: response and conversation table names must be distinct").into());
     }
-    if let Some(pool) = &cfg.pool {
-        pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
-    }
-    if let Some(compression) = &cfg.compression {
-        compression.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
-    }
+    validate_optional_sections(cfg)?;
     match cfg.backend {
         StorageBackend::Sqlite => {
             validate_sqlite_database_url(database_url)?;

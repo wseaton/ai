@@ -10,8 +10,8 @@
 //! metadata, the promoted headers and filter results, the proxy-owned
 //! identifiers, and [`ResponsesState`].
 //!
-//! Create requests with `background=true` are rejected, because Praxis does not
-//! implement the asynchronous Responses lifecycle.
+//! Create requests with `background=true` are rejected unless `background` is
+//! `continue`, for a chain whose response store runs background responses.
 //!
 //! This replaces the pair of `openai_responses_format` and
 //! `openai_responses_validate` for create requests. Those two each parsed the
@@ -143,7 +143,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             Err(format) => return handle_unclassifiable(ctx, format, &self.config),
         };
 
-        if let Some(action) = super::handle_unsupported_background(&classified) {
+        if let Some(action) = super::handle_unsupported_background(&classified, self.config.background) {
             return Ok(action);
         }
 

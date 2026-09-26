@@ -43,6 +43,17 @@ impl ReasoningDialect {
     }
 }
 
+/// How a dialect without safe summaries handles a requested reasoning summary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SummaryHandling {
+    /// Reject the request.
+    #[default]
+    Reject,
+    /// Run the request and return reasoning items without a summary.
+    Omit,
+}
+
 /// Resolved backend-specific reasoning configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -51,6 +62,8 @@ pub(crate) struct ReasoningOptions {
     pub(crate) dialect: ReasoningDialect,
     /// Maximum raw reasoning size preserved per response.
     pub(crate) max_reasoning_bytes: usize,
+    /// Handling of a requested summary the dialect cannot produce.
+    pub(crate) summary: SummaryHandling,
 }
 
 impl Default for ReasoningOptions {
@@ -58,6 +71,7 @@ impl Default for ReasoningOptions {
         Self {
             dialect: ReasoningDialect::None,
             max_reasoning_bytes: DEFAULT_MAX_REASONING_BYTES,
+            summary: SummaryHandling::Reject,
         }
     }
 }
@@ -155,7 +169,8 @@ fn summary_control<'a>(
 }
 
 /// Validate that a requested reasoning summary is compatible with the dialect.
-/// A summary request against a dialect without a safe-summary contract is rejected.
+/// A summary request against a dialect without a safe-summary contract is
+/// rejected unless the options say to omit the summary.
 pub(crate) fn validate_requested_reasoning(
     request: &Map<String, Value>,
     options: &ReasoningOptions,
@@ -170,7 +185,10 @@ pub(crate) fn validate_requested_reasoning(
         },
     };
 
-    if requested_summary(reasoning)?.is_some() && !options.dialect.supports_safe_summary() {
+    if requested_summary(reasoning)?.is_some()
+        && !options.dialect.supports_safe_summary()
+        && options.summary == SummaryHandling::Reject
+    {
         return Err(TranslationError::UnsupportedReasoningSummary);
     }
 
@@ -304,7 +322,7 @@ fn resolve_vllm_reasoning(message: &Map<String, Value>) -> Result<Option<&str>, 
 }
 
 /// Build a schema-complete `Responses` reasoning item carrying raw reasoning.
-fn reasoning_item(id: String, status: &str, text: &str) -> Value {
+pub(crate) fn reasoning_item(id: String, status: &str, text: &str) -> Value {
     json!({
         "id": Value::String(id),
         "type": "reasoning",

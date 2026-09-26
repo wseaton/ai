@@ -1181,6 +1181,19 @@ async fn fetch_conversation(
     })
 }
 
+/// The pipeline state of the request `body` continuing the stored response
+/// `previous`, as this filter builds it: the previous response must be
+/// `completed`, and its stored history precedes the new input.
+pub(crate) fn continuation_state(body: Value, previous: ResponseRecord) -> Result<ResponsesState, FilterAction> {
+    validate_response_status(&previous)?;
+    Ok(build_state(
+        body,
+        stored_messages_for_response(previous),
+        Vec::new(),
+        None,
+    ))
+}
+
 /// Build [`ResponsesState`] by prepending stored messages before the current input.
 fn build_state(
     parsed_body: Value,

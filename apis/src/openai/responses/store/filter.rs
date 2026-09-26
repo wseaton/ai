@@ -66,6 +66,7 @@ use super::{
         state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
+    background::Background,
     config::{ResponseStoreConfig, StorageBackend, validate_config},
     list_input_items,
 };
@@ -100,6 +101,9 @@ pub struct ResponseStoreFilter {
     /// Lazily initialized store backend. SQLite init failures are cached
     /// as `None`; Postgres init failures are retried on every code path.
     pub(crate) store: OnceCell<Option<Arc<dyn ResponseStore>>>,
+
+    /// Background responses, when configured.
+    background: Option<Background>,
 }
 
 impl ResponseStoreFilter {
@@ -115,8 +119,9 @@ impl ResponseStoreFilter {
     }
 
     /// Create a filter from validated config.
-    pub(super) fn new(config: ResponseStoreConfig) -> Self {
+    pub(super) fn new(mut config: ResponseStoreConfig) -> Self {
         Self {
+            background: config.background.take().map(Background::new),
             config,
             store: OnceCell::new(),
         }
@@ -425,7 +430,7 @@ fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
 }
 
 /// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
+pub(super) fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
     let mut messages = Vec::new();
 
     append_stored_input_items(&mut messages, input);
@@ -853,6 +858,13 @@ impl HttpFilter for ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if ctx.request.method == http::Method::POST
+            && let Some(background) = &self.background
+            && let Some(id) = extract_cancel_id(ctx.request.uri.path())
+        {
+            return Ok(self.handle_cancel(ctx, background, id).await);
+        }
+
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
         }
@@ -881,6 +893,9 @@ impl HttpFilter for ResponseStoreFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
+        }
+        if is_background_create(ctx) {
+            return Ok(self.create_background(ctx, body.as_ref()).await);
         }
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
@@ -980,6 +995,64 @@ impl HttpFilter for ResponseStoreFilter {
 }
 
 // -----------------------------------------------------------------------------
+// Background Responses
+// -----------------------------------------------------------------------------
+
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "background responses are a distinct concern"
+)]
+impl ResponseStoreFilter {
+    /// Serve a `background: true` create request.
+    async fn create_background(&self, ctx: &HttpFilterContext<'_>, body: Option<&Bytes>) -> FilterAction {
+        let Some(background) = &self.background else {
+            return FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "background mode is not supported",
+            ));
+        };
+        let owner = match require_state_owner(ctx) {
+            Ok(owner) => owner,
+            Err(action) => return action,
+        };
+        let Some(store) = self.ensure_store().await else {
+            return FilterAction::Reject(reject_store_error());
+        };
+        let request: Value = match body.map(|b| serde_json::from_slice(b)) {
+            Some(Ok(request)) => request,
+            Some(Err(_)) | None => return FilterAction::Reject(reject_invalid_input("invalid JSON body")),
+        };
+        Box::pin(background.create(ctx, store.as_ref(), owner, &request)).await
+    }
+
+    /// Serve `POST /v1/responses/{id}/cancel`.
+    async fn handle_cancel(&self, ctx: &HttpFilterContext<'_>, background: &Background, id: &str) -> FilterAction {
+        let record = match self.load_record(ctx, id).await {
+            Ok(record) => record,
+            Err(action) => return action,
+        };
+        let Some(store) = self.ensure_store().await else {
+            return FilterAction::Reject(reject_store_error());
+        };
+        Box::pin(background.cancel(store.as_ref(), record, ctx.time_source.now().as_secs())).await
+    }
+}
+
+/// Whether the request creates a background response.
+fn is_background_create(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("openai_responses_format.background") == Some("true")
+        && is_responses_create(&ctx.request.method, ctx.request.uri.path())
+}
+
+/// Extract the response ID from a `/v1/responses/{id}/cancel` path.
+pub(super) fn extract_cancel_id(path: &str) -> Option<&str> {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    let id = path.strip_prefix("/v1/responses/")?.strip_suffix("/cancel")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+// -----------------------------------------------------------------------------
 // GET Retrieval
 // -----------------------------------------------------------------------------
 
@@ -1039,6 +1112,12 @@ impl ResponseStoreFilter {
 
         match store.get_response(owner, id).await {
             Ok(Some(record)) => {
+                let record = match &self.background {
+                    Some(background) => {
+                        Box::pin(background.refresh(store.as_ref(), record, ctx.time_source.now().as_secs())).await
+                    },
+                    None => record,
+                };
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
                     Rejection::status(200)

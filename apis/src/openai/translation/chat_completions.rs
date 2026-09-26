@@ -349,6 +349,33 @@ struct RequestOverrides<'a> {
 // Request Translation
 // -----------------------------------------------------------------------------
 
+/// How a translating filter handles `truncation: "auto"`, which Chat
+/// Completions cannot represent.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TruncationAuto {
+    /// Reject the request.
+    #[default]
+    Reject,
+    /// Run it as `truncation: "disabled"`: a context that fits the model is
+    /// unaffected, and one that does not fails instead of being truncated.
+    /// The response reports `disabled`.
+    Disabled,
+}
+
+impl TruncationAuto {
+    /// Rewrite `truncation: "auto"` in a Responses `request` as this handling
+    /// says, before translation.
+    pub(crate) fn apply(self, request: &mut Value) {
+        if self == Self::Disabled
+            && request.get("truncation").and_then(Value::as_str) == Some("auto")
+            && let Some(fields) = request.as_object_mut()
+        {
+            fields.insert("truncation".to_owned(), Value::String(DEFAULT_TRUNCATION.to_owned()));
+        }
+    }
+}
+
 /// Convert an `OpenAI` `Responses` create request into a Chat Completions request.
 pub(crate) fn responses_request_to_chat_request(
     request: &Value,

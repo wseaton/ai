@@ -7,7 +7,10 @@ use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
 use super::stream::StreamLimits;
-use crate::openai::{responses::body_limits::validate_size_limit, translation::reasoning::ReasoningOptions};
+use crate::openai::{
+    responses::body_limits::validate_size_limit,
+    translation::{chat_completions::TruncationAuto, reasoning::ReasoningOptions},
+};
 
 /// Default SSE reassembly buffer ceiling in bytes.
 const DEFAULT_MAX_SSE_BUFFER_BYTES: usize = 1 << 20;
@@ -138,6 +141,9 @@ pub(super) struct ResponsesToChatCompletionsConfig {
     /// Backend-specific dialect behavior.
     #[serde(default)]
     pub reasoning: ReasoningOptions,
+    /// Handling of `truncation: "auto"`.
+    #[serde(default)]
+    pub truncation_auto: TruncationAuto,
 }
 
 impl Default for ResponsesToChatCompletionsConfig {
@@ -152,6 +158,7 @@ impl Default for ResponsesToChatCompletionsConfig {
             max_stream_frames: DEFAULT_MAX_STREAM_FRAMES,
             max_emitted_sse_frame_bytes: DEFAULT_MAX_EMITTED_SSE_FRAME_BYTES,
             reasoning: ReasoningOptions::default(),
+            truncation_auto: TruncationAuto::default(),
         }
     }
 }

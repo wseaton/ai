@@ -123,6 +123,22 @@ pub(crate) struct ResponsesFormatConfig {
     /// other internal `x-praxis-*` names. Dedicated defaults remain allowed.
     #[serde(default)]
     pub headers: ResponsesFormatHeaders,
+
+    /// Handling of Responses create requests with `background: true`.
+    #[serde(default)]
+    pub background: BackgroundHandling,
+}
+
+/// How [`ResponsesFormatConfig`] handles `background: true`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackgroundHandling {
+    /// Reject with a 400: nothing in the chain runs background responses.
+    #[default]
+    Reject,
+    /// Continue to `openai_response_store`, whose `background` section runs
+    /// them.
+    Continue,
 }
 
 // -----------------------------------------------------------------------------
@@ -225,6 +241,7 @@ extra: true
     fn build_config_invalid_header_name_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("not a valid header!".into()),
                 model: default_model_header(),
@@ -243,6 +260,7 @@ extra: true
     fn build_config_valid_custom_headers_ok() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-custom-format".into()),
                 model: Some("x-custom-model".into()),
@@ -257,6 +275,7 @@ extra: true
     fn build_config_authorization_header_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: default_format_header(),
                 model: Some("authorization".into()),
@@ -275,6 +294,7 @@ extra: true
     fn build_config_api_key_header_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: default_format_header(),
                 model: Some("x-api-key".into()),
@@ -293,6 +313,7 @@ extra: true
     fn build_config_unrelated_internal_header_rejected() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-praxis-route".into()),
                 model: default_model_header(),
@@ -311,6 +332,7 @@ extra: true
     fn build_config_model_header_rejects_format_routing_fact() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: default_format_header(),
                 model: Some("x-praxis-ai-format".into()),
@@ -329,6 +351,7 @@ extra: true
     fn build_config_format_header_rejects_model_rewrite_fact() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-praxis-ai-effective-model".into()),
                 model: default_model_header(),
@@ -347,6 +370,7 @@ extra: true
     fn build_config_accepts_dedicated_defaults() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders::default(),
         };
         assert!(
@@ -359,6 +383,7 @@ extra: true
     fn build_config_rejects_duplicate_promotion_headers() {
         let cfg = ResponsesFormatConfig {
             on_invalid: OnInvalidBehavior::default_continue(),
+            background: BackgroundHandling::Reject,
             headers: ResponsesFormatHeaders {
                 format: Some("x-foo".into()),
                 model: Some("X-Foo".into()),

@@ -65,6 +65,12 @@ pub(super) struct ChatDelta<'a> {
     /// Incremental refusal text.
     #[serde(default, borrow)]
     pub refusal: Option<Cow<'a, str>>,
+    /// Incremental raw reasoning (vLLM `reasoning`).
+    #[serde(default, borrow)]
+    pub reasoning: Option<Cow<'a, str>>,
+    /// Incremental raw reasoning under vLLM's deprecated `reasoning_content`.
+    #[serde(default, borrow)]
+    pub reasoning_content: Option<Cow<'a, str>>,
     /// Incremental tool-call fragments keyed by their own index.
     #[serde(default)]
     pub tool_calls: Vec<ChatToolCallFragment<'a>>,

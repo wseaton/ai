@@ -117,7 +117,7 @@ use praxis_filter::{
 };
 use tracing::{debug, trace};
 
-use self::config::{ResponsesFormatConfig, build_config};
+use self::config::{BackgroundHandling, ResponsesFormatConfig, build_config};
 use crate::{
     classifier::{
         AiRequestFormat, ClassifiedRequest, classify_request_body, empty_result, is_responses_create,
@@ -319,7 +319,7 @@ impl HttpFilter for ResponsesFormatFilter {
             return Ok(action);
         }
 
-        if let Some(action) = handle_unsupported_background(&classified) {
+        if let Some(action) = handle_unsupported_background(&classified, self.config.background) {
             return Ok(action);
         }
 
@@ -416,13 +416,17 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
     }
 }
 
-/// Reject Responses create requests that request background execution.
+/// Reject Responses create requests that request background execution,
+/// unless the chain runs them (`background: continue`, with the response
+/// store's `background` section).
 ///
-/// Praxis does not implement the asynchronous Responses lifecycle
-/// (schedule, poll, cancel), so `background=true` is rejected uniformly
-/// before routing or upstream contact with an OpenAI-shaped 400.
-fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<FilterAction> {
-    if classified.format == AiRequestFormat::Responses && classified.background == Some(true) {
+/// Rejection happens before routing or upstream contact, with an
+/// OpenAI-shaped 400.
+fn handle_unsupported_background(classified: &ClassifiedRequest, handling: BackgroundHandling) -> Option<FilterAction> {
+    if handling == BackgroundHandling::Reject
+        && classified.format == AiRequestFormat::Responses
+        && classified.background == Some(true)
+    {
         return Some(FilterAction::Reject(error::responses_error_rejection(
             400,
             "invalid_request_error",
