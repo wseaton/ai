@@ -6,6 +6,12 @@
 //! Monitors the config file for changes, debounces filesystem
 //! events, and triggers [`reload_pipelines`] on each valid change.
 //!
+//! The watcher observes the config file's directory, so it sees
+//! atomic replaces (a rename over the file, or a Kubernetes
+//! `ConfigMap` swapping its `..data` symlink). Events for other files
+//! in that directory arrive too; a reload happens only when the config
+//! file's content differs from what was last loaded.
+//!
 //! [`reload_pipelines`]: crate::reload::reload_pipelines
 
 use std::{
@@ -106,11 +112,12 @@ async fn watch_loop(params: WatcherParams) {
     };
 
     info!(path = %params.config_path.display(), "config file watcher started");
-    run_event_loop(&mut rx, &params).await;
+    let loaded = std::fs::read_to_string(&params.config_path).ok();
+    run_event_loop(&mut rx, &params, loaded).await;
 }
 
 /// Process filesystem events until shutdown is requested.
-async fn run_event_loop(rx: &mut mpsc::Receiver<()>, params: &WatcherParams) {
+async fn run_event_loop(rx: &mut mpsc::Receiver<()>, params: &WatcherParams, mut loaded: Option<String>) {
     let mut current_config = params.initial_config.clone();
     loop {
         tokio::select! {
@@ -119,6 +126,7 @@ async fn run_event_loop(rx: &mut mpsc::Receiver<()>, params: &WatcherParams) {
                 drain_and_debounce(rx).await;
                 handle_reload(
                     &params.config_path,
+                    &mut loaded,
                     &mut current_config,
                     &params.registry,
                     &params.pipelines,
@@ -135,7 +143,8 @@ async fn run_event_loop(rx: &mut mpsc::Receiver<()>, params: &WatcherParams) {
     }
 }
 
-/// Read the config file, parse it, and attempt a reload.
+/// Read the config file and, when its content differs from `loaded`,
+/// parse it and attempt a reload.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -143,6 +152,7 @@ async fn run_event_loop(rx: &mut mpsc::Receiver<()>, params: &WatcherParams) {
 )]
 fn handle_reload(
     config_path: &PathBuf,
+    loaded: &mut Option<String>,
     current_config: &mut Config,
     registry: &FilterRegistry,
     pipelines: &ListenerPipelines,
@@ -150,21 +160,14 @@ fn handle_reload(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) {
-    let content = match std::fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                path = %config_path.display(),
-                error = %e,
-                "failed to read config file for reload"
-            );
-            return;
-        },
+    let Some(content) = changed_content(config_path, loaded.as_deref()) else {
+        return;
     };
 
     let new_config = match Config::from_yaml(&content) {
         Ok(c) => c,
         Err(e) => {
+            *loaded = Some(content);
             error!(
                 path = %config_path.display(),
                 error = %e,
@@ -185,11 +188,33 @@ fn handle_reload(
     ) {
         Ok(()) => {
             *current_config = new_config;
+            *loaded = Some(content);
         },
         Err(e) => {
             error!(error = %e, "config reload failed");
         },
     }
+}
+
+/// The config file's content when it differs from `loaded`. `None` when
+/// it is unchanged or cannot be read.
+fn changed_content(config_path: &PathBuf, loaded: Option<&str>) -> Option<String> {
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                path = %config_path.display(),
+                error = %e,
+                "failed to read config file for reload"
+            );
+            return None;
+        },
+    };
+    if loaded == Some(content.as_str()) {
+        tracing::debug!(path = %config_path.display(), "config file unchanged, not reloading");
+        return None;
+    }
+    Some(content)
 }
 
 /// Set up a [`RecommendedWatcher`] that sends to the given channel
@@ -358,6 +383,64 @@ mod tests {
 
         let new_ptr = Arc::as_ptr(&pipelines.get("web").unwrap().load());
         assert_ne!(old_ptr, new_ptr, "pipeline should be swapped after config file change");
+
+        shutdown.cancel();
+    }
+
+    #[test]
+    fn watcher_ignores_other_files_and_unchanged_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("praxis.yaml");
+        std::fs::write(&config_path, VALID_YAML).unwrap();
+
+        let config = Config::from_yaml(VALID_YAML).unwrap();
+        let registry = Arc::new(FilterRegistry::with_builtins());
+        let health_registry = Arc::new(std::collections::HashMap::new());
+        let kv_stores = praxis_core::kv::KvStoreRegistry::new();
+        let pipelines = Arc::new(
+            crate::pipelines::resolve_pipelines(&config, &registry, &health_registry, &kv_stores, &test_client())
+                .unwrap(),
+        );
+        let old_ptr = Arc::as_ptr(&pipelines.get("web").unwrap().load());
+        let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
+        let shutdown = CancellationToken::new();
+
+        let _handle = spawn_config_watcher(WatcherParams {
+            config_path: config_path.clone(),
+            health_shutdown,
+            initial_config: config,
+            kv_stores: praxis_core::kv::KvStoreRegistry::new(),
+            pipelines: Arc::clone(&pipelines),
+            registry: Arc::clone(&registry),
+            shutdown: shutdown.clone(),
+            subrequest_client: test_client(),
+        });
+
+        std::thread::sleep(Duration::from_millis(WATCHER_STARTUP_MS));
+
+        // A database or log next to the config, written continuously.
+        let sibling = dir.path().join("responses.db");
+        for i in 0..10 {
+            std::fs::write(&sibling, format!("row {i}")).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::write(&config_path, VALID_YAML).unwrap();
+        std::thread::sleep(Duration::from_millis(DEBOUNCE_MS + 300));
+        assert_eq!(
+            old_ptr,
+            Arc::as_ptr(&pipelines.get("web").unwrap().load()),
+            "writes to other files and an identical rewrite must not reload"
+        );
+
+        std::fs::write(&config_path, VALID_YAML_CHANGED).unwrap();
+        poll_until(Duration::from_secs(5), || {
+            Arc::as_ptr(&pipelines.get("web").unwrap().load()) != old_ptr
+        });
+        assert_ne!(
+            old_ptr,
+            Arc::as_ptr(&pipelines.get("web").unwrap().load()),
+            "a changed config still reloads"
+        );
 
         shutdown.cancel();
     }
